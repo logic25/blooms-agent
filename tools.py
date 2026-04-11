@@ -297,6 +297,194 @@ async def get_overview(params: dict = None) -> dict:
     )
 
 
+async def get_morning_brief(params: dict = None) -> dict:
+    """Generate the full morning operations brief — orders, inventory gaps,
+    what to order, who to call. This is the core daily workflow tool."""
+    from datetime import timedelta
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+    tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    week_end = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # 1. Get today's and upcoming orders
+    orders_result = await _blooms_db_get(
+        "blooms_daily_orders",
+        {
+            "select": "id,product_id,quantity,delivery_date,delivery_time,"
+                      "customer_name,notes,status",
+            "status": "neq.fulfilled",
+            "delivery_date": f"lte.{week_end}",
+            "order": "delivery_date,delivery_time.nullslast",
+        },
+    )
+    orders = orders_result.get("data", [])
+
+    # 2. Get all products + recipes
+    prod_result = await _blooms_db_get(
+        "blooms_products", {"select": "id,name,price"}
+    )
+    products = {p["id"]: p for p in prod_result.get("data", [])}
+
+    recipe_result = await _blooms_db_get(
+        "blooms_recipe_items", {"select": "product_id,flower_type,quantity"}
+    )
+    recipes_by_product = {}
+    for r in recipe_result.get("data", []):
+        pid = r["product_id"]
+        if pid not in recipes_by_product:
+            recipes_by_product[pid] = []
+        recipes_by_product[pid].append(r)
+
+    # 3. Get current cooler inventory
+    inv_result = await _blooms_db_get(
+        "blooms_cooler_inventory", {"select": "flower_type,quantity"}
+    )
+    cooler = {i["flower_type"]: i["quantity"] for i in inv_result.get("data", [])}
+
+    # 4. Get vendor info + pricing
+    vendor_result = await _blooms_db_get(
+        "blooms_vendors",
+        {"select": "id,name,phone,email,order_cutoff,delivery_days,"
+                   "reliability_rating,specialties"},
+    )
+    vendors = {v["id"]: v for v in vendor_result.get("data", [])}
+
+    vendor_inv_result = await _blooms_db_get(
+        "blooms_vendor_inventory",
+        {"select": "vendor_id,flower_type,regular_price,peak_price,quality_rating"},
+    )
+    # Best vendor per flower (lowest regular price with quality >= 4)
+    best_vendor_for = {}
+    for vi in vendor_inv_result.get("data", []):
+        ft = vi["flower_type"]
+        if ft not in best_vendor_for or vi["regular_price"] < best_vendor_for[ft]["regular_price"]:
+            best_vendor_for[ft] = vi
+
+    # 5. Calculate flower needs per day
+    def calc_needs(day_orders):
+        needs = {}
+        for order in day_orders:
+            recipe = recipes_by_product.get(order["product_id"], [])
+            for item in recipe:
+                ft = item["flower_type"]
+                stems = item["quantity"] * order["quantity"]
+                needs[ft] = needs.get(ft, 0) + stems
+        return needs
+
+    today_orders = [o for o in orders if o.get("delivery_date") == today_str]
+    tomorrow_orders = [o for o in orders if o.get("delivery_date") == tomorrow_str]
+    week_orders = orders  # all pending within the week
+
+    today_needs = calc_needs(today_orders)
+    tomorrow_needs = calc_needs(tomorrow_orders)
+    week_needs = calc_needs(week_orders)
+
+    # 6. Find gaps (need vs have)
+    def find_gaps(needs):
+        gaps = []
+        for flower, needed in sorted(needs.items()):
+            have = cooler.get(flower, 0)
+            if needed > have:
+                gap = needed - have
+                # Find best vendor
+                vendor_info = best_vendor_for.get(flower, {})
+                vendor_id = vendor_info.get("vendor_id")
+                vendor = vendors.get(vendor_id, {}) if vendor_id else {}
+                # Round up to nearest bunch of 25 for roses, 10 for others
+                order_qty = gap + 10  # buffer
+                est_cost = round(order_qty * vendor_info.get("regular_price", 0), 2)
+
+                gaps.append({
+                    "flower_type": flower,
+                    "needed": needed,
+                    "in_stock": have,
+                    "shortfall": gap,
+                    "order_quantity": order_qty,
+                    "vendor_name": vendor.get("name", "Unknown"),
+                    "vendor_phone": vendor.get("phone", ""),
+                    "price_per_stem": vendor_info.get("regular_price", 0),
+                    "estimated_cost": est_cost,
+                })
+        return gaps
+
+    today_gaps = find_gaps(today_needs)
+    tomorrow_gaps = find_gaps(tomorrow_needs)
+
+    # 7. Enrich orders with product names
+    def enrich(order_list):
+        enriched = []
+        for o in order_list:
+            prod = products.get(o.get("product_id"), {})
+            enriched.append({
+                "quantity": o["quantity"],
+                "product": prod.get("name", "Unknown"),
+                "price": prod.get("price", 0),
+                "customer": o.get("customer_name", "Walk-in"),
+                "delivery_time": o.get("delivery_time", ""),
+                "notes": o.get("notes", ""),
+                "line_total": o["quantity"] * prod.get("price", 0),
+            })
+        return enriched
+
+    today_enriched = enrich(today_orders)
+    tomorrow_enriched = enrich(tomorrow_orders)
+
+    today_revenue = sum(o["line_total"] for o in today_enriched)
+    tomorrow_revenue = sum(o["line_total"] for o in tomorrow_enriched)
+
+    # 8. Build vendor call list (group gaps by vendor)
+    calls = {}
+    for gap in tomorrow_gaps:
+        vname = gap["vendor_name"]
+        if vname not in calls:
+            calls[vname] = {
+                "vendor": vname,
+                "phone": gap["vendor_phone"],
+                "items": [],
+                "total_cost": 0,
+            }
+        calls[vname]["items"].append({
+            "flower": gap["flower_type"],
+            "quantity": gap["order_quantity"],
+            "cost": gap["estimated_cost"],
+        })
+        calls[vname]["total_cost"] += gap["estimated_cost"]
+
+    # Out of stock / low stock alerts
+    out_of_stock = [ft for ft, qty in cooler.items() if qty == 0]
+    low_stock = [f"{ft} ({qty})" for ft, qty in cooler.items() if 0 < qty <= 10]
+
+    return {
+        "date": today.strftime("%A, %B %d, %Y"),
+        "today": {
+            "orders": today_enriched,
+            "order_count": len(today_orders),
+            "revenue": today_revenue,
+            "gaps": today_gaps,
+            "all_in_stock": len(today_gaps) == 0,
+        },
+        "tomorrow": {
+            "orders": tomorrow_enriched,
+            "order_count": len(tomorrow_orders),
+            "revenue": tomorrow_revenue,
+            "gaps": tomorrow_gaps,
+        },
+        "vendor_calls": list(calls.values()),
+        "total_ordering_cost": round(sum(c["total_cost"] for c in calls.values()), 2),
+        "inventory_alerts": {
+            "out_of_stock": out_of_stock,
+            "low_stock": low_stock,
+        },
+        "week_summary": {
+            "total_orders": len(week_orders),
+            "total_revenue": sum(
+                o["quantity"] * products.get(o["product_id"], {}).get("price", 0)
+                for o in week_orders
+            ),
+        },
+    }
+
+
 async def get_inventory(params: dict = None) -> dict:
     """Get current cooler inventory — real-time flower counts."""
     params = params or {}
@@ -434,6 +622,7 @@ TOOL_DISPATCH = {
     "get_tasks": get_tasks,
     "get_expenses": get_expenses,
     "suggest_order": suggest_order,
+    "get_morning_brief": get_morning_brief,
     "get_overview": get_overview,
     "get_inventory": get_inventory,
     "get_orders": get_orders,
@@ -509,6 +698,19 @@ TOOL_DEFINITIONS = [
         "name": "get_overview",
         "description": "Get the full Blooms business snapshot: revenue, expenses, "
                        "budget, employees, status. Use for general 'how is the business' questions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_morning_brief",
+        "description": "Generate the full morning operations brief. Calculates: "
+                       "today's orders, tomorrow's orders, flowers needed vs in stock, "
+                       "inventory gaps, which vendors to call, estimated costs, "
+                       "and total revenue. THIS IS THE PRIMARY TOOL — call it for "
+                       "'morning brief', 'what do I need today', 'what should I order', "
+                       "'who do I call', or any daily operations question.",
         "input_schema": {
             "type": "object",
             "properties": {},
