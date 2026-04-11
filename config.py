@@ -13,6 +13,8 @@ BLOOMS_SUPABASE_URL = os.getenv("BLOOMS_SUPABASE_URL", "")
 BLOOMS_SUPABASE_KEY = os.getenv("BLOOMS_SUPABASE_KEY", "")
 
 # CORS — allowed origins for the chat widget
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000")
+# Support "*" to allow all origins (useful during development)
+ALLOWED_ORIGINS = "*" if _raw_origins.strip() == "*" else [o.strip() for o in _raw_origins.split(",")]
 
 PORT = int(os.getenv("PORT", "8080"))

@@ -19,7 +19,7 @@ logging.basicConfig(
 log = logging.getLogger("blooms.server")
 
 app = Flask(__name__)
-CORS(app, origins=config.ALLOWED_ORIGINS)
+CORS(app, origins=config.ALLOWED_ORIGINS, supports_credentials=False)
 
 # Shared event loop for async tool calls
 _loop = asyncio.new_event_loop()
