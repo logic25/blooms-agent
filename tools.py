@@ -13,6 +13,10 @@ log = logging.getLogger("blooms.tools")
 # Cache for Blooms entity ID
 _blooms_entity_id: str | None = None
 
+# Blooms OS Supabase (floral operations data)
+BLOOMS_SUPABASE_URL = "https://pqhatplothwhdanfrcrq.supabase.co"
+BLOOMS_SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBxaGF0cGxvdGh3aGRhbmZyY3JxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDE0NzM5NDgsImV4cCI6MjA1NzA0OTk0OH0.4nmjVjWu_hylb7WaNKsPk6_JMXAWX5C4n5V1zp_Gr88"
+
 
 async def _supabase_get(table: str, params: dict = None) -> dict:
     """Query Venture Studio Supabase."""
@@ -34,6 +38,25 @@ async def _supabase_get(table: str, params: dict = None) -> dict:
             return {"data": resp.json()}
     except Exception as e:
         log.error(f"Supabase query error ({table}): {e}")
+        return {"error": str(e)}
+
+
+async def _blooms_db_get(table: str, params: dict = None) -> dict:
+    """Query Blooms OS Supabase (floral operations tables)."""
+    url = f"{BLOOMS_SUPABASE_URL}/rest/v1/{table}"
+    headers = {
+        "apikey": BLOOMS_SUPABASE_KEY,
+        "Authorization": f"Bearer {BLOOMS_SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=headers, params=params or {})
+            if resp.status_code != 200:
+                return {"error": f"Blooms DB returned {resp.status_code}: {resp.text[:200]}"}
+            return {"data": resp.json()}
+    except Exception as e:
+        log.error(f"Blooms DB query error ({table}): {e}")
         return {"error": str(e)}
 
 
@@ -235,6 +258,15 @@ async def suggest_order(params: dict = None) -> dict:
         "Are there items that aren't selling and going to waste?"
     )
 
+    # Pull real inventory data
+    inv_result = await _blooms_db_get(
+        "blooms_cooler_inventory",
+        {"select": "flower_type,quantity", "order": "quantity"},
+    )
+    inventory = inv_result.get("data", [])
+    out_of_stock = [i["flower_type"] for i in inventory if i.get("quantity", 0) == 0]
+    low_stock = [f"{i['flower_type']} ({i['quantity']} stems)" for i in inventory if 0 < i.get("quantity", 0) <= 10]
+
     return {
         "date": today.strftime("%A, %B %d, %Y"),
         "day_advice": day_advice,
@@ -242,7 +274,11 @@ async def suggest_order(params: dict = None) -> dict:
         "always_stock": staples,
         "cogs_reminder": cogs_note,
         "house_accounts_check": "Check standing orders for Hofstra, Adelphi, N.F. Walker this week.",
-        "note": "This is based on general patterns. Live inventory data is not connected yet.",
+        "current_inventory": {
+            "out_of_stock": out_of_stock,
+            "low_stock": low_stock,
+            "total_items": len(inventory),
+        },
     }
 
 
@@ -261,6 +297,137 @@ async def get_overview(params: dict = None) -> dict:
     )
 
 
+async def get_inventory(params: dict = None) -> dict:
+    """Get current cooler inventory — real-time flower counts."""
+    params = params or {}
+    inv_params = {"select": "flower_type,quantity,last_updated", "order": "flower_type"}
+    if params.get("flower_type"):
+        inv_params["flower_type"] = f"ilike.%{params['flower_type']}%"
+
+    result = await _blooms_db_get("blooms_cooler_inventory", inv_params)
+    items = result.get("data", [])
+
+    # Summary stats
+    total_stems = sum(i.get("quantity", 0) for i in items)
+    out_of_stock = [i["flower_type"] for i in items if i.get("quantity", 0) == 0]
+    low_stock = [i["flower_type"] for i in items if 0 < i.get("quantity", 0) <= 10]
+
+    return {
+        "inventory": items,
+        "total_stems": total_stems,
+        "out_of_stock": out_of_stock,
+        "low_stock": low_stock,
+        "item_count": len(items),
+        "error": result.get("error"),
+    }
+
+
+async def get_orders(params: dict = None) -> dict:
+    """Get current daily orders with product names."""
+    params = params or {}
+    order_params = {
+        "select": "id,product_id,quantity,delivery_date,delivery_time,"
+                  "customer_name,notes,status,created_at",
+        "order": "delivery_date,created_at",
+    }
+    if params.get("status"):
+        order_params["status"] = f"eq.{params['status']}"
+    if params.get("date"):
+        order_params["delivery_date"] = f"eq.{params['date']}"
+
+    result = await _blooms_db_get("blooms_daily_orders", order_params)
+    orders = result.get("data", [])
+
+    # Get products to map names
+    prod_result = await _blooms_db_get("blooms_products", {"select": "id,name,price"})
+    products = {p["id"]: p for p in prod_result.get("data", [])}
+
+    # Enrich orders with product info
+    for order in orders:
+        prod = products.get(order.get("product_id"), {})
+        order["product_name"] = prod.get("name", "Unknown")
+        order["unit_price"] = prod.get("price", 0)
+        order["line_total"] = order.get("quantity", 0) * prod.get("price", 0)
+
+    # Stats
+    pending = [o for o in orders if o.get("status") == "pending"]
+    fulfilled = [o for o in orders if o.get("status") == "fulfilled"]
+    total_revenue = sum(o.get("line_total", 0) for o in orders)
+
+    return {
+        "orders": orders,
+        "stats": {
+            "total": len(orders),
+            "pending": len(pending),
+            "fulfilled": len(fulfilled),
+            "total_revenue": total_revenue,
+        },
+        "error": result.get("error"),
+    }
+
+
+async def get_products_list(params: dict = None) -> dict:
+    """Get all products with their recipes."""
+    prod_result = await _blooms_db_get(
+        "blooms_products",
+        {"select": "id,name,category,price,is_active", "order": "name"},
+    )
+    recipe_result = await _blooms_db_get(
+        "blooms_recipe_items",
+        {"select": "product_id,flower_type,quantity,notes"},
+    )
+
+    # Group recipes by product
+    recipes = {}
+    for r in recipe_result.get("data", []):
+        pid = r["product_id"]
+        if pid not in recipes:
+            recipes[pid] = []
+        recipes[pid].append(r)
+
+    products = prod_result.get("data", [])
+    for p in products:
+        p["recipe"] = recipes.get(p["id"], [])
+
+    return {
+        "products": products,
+        "count": len(products),
+        "error": prod_result.get("error"),
+    }
+
+
+async def get_vendors_list(params: dict = None) -> dict:
+    """Get all vendors with their inventory/pricing."""
+    vendor_result = await _blooms_db_get(
+        "blooms_vendors",
+        {"select": "id,name,phone,email,lead_time_days,order_cutoff,"
+                   "delivery_days,payment_terms,reliability_rating,specialties,notes",
+         "order": "name"},
+    )
+    inv_result = await _blooms_db_get(
+        "blooms_vendor_inventory",
+        {"select": "vendor_id,flower_type,regular_price,peak_price,quality_rating,notes"},
+    )
+
+    # Group inventory by vendor
+    vendor_inv = {}
+    for item in inv_result.get("data", []):
+        vid = item["vendor_id"]
+        if vid not in vendor_inv:
+            vendor_inv[vid] = []
+        vendor_inv[vid].append(item)
+
+    vendors = vendor_result.get("data", [])
+    for v in vendors:
+        v["inventory"] = vendor_inv.get(v["id"], [])
+
+    return {
+        "vendors": vendors,
+        "count": len(vendors),
+        "error": vendor_result.get("error"),
+    }
+
+
 # Dispatch map
 TOOL_DISPATCH = {
     "get_financial_health": get_financial_health,
@@ -268,6 +435,10 @@ TOOL_DISPATCH = {
     "get_expenses": get_expenses,
     "suggest_order": suggest_order,
     "get_overview": get_overview,
+    "get_inventory": get_inventory,
+    "get_orders": get_orders,
+    "get_products_list": get_products_list,
+    "get_vendors_list": get_vendors_list,
 }
 
 # Tool definitions for Claude
@@ -338,6 +509,60 @@ TOOL_DEFINITIONS = [
         "name": "get_overview",
         "description": "Get the full Blooms business snapshot: revenue, expenses, "
                        "budget, employees, status. Use for general 'how is the business' questions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_inventory",
+        "description": "Get current cooler inventory — real-time flower stem counts. "
+                       "Shows what's in the cooler right now, what's out of stock, "
+                       "and what's running low. Use for 'how many roses?', "
+                       "'what do we have?', 'what are we low on?'",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "flower_type": {
+                    "type": "string",
+                    "description": "Filter by flower name (partial match, e.g. 'rose')"
+                },
+            },
+        },
+    },
+    {
+        "name": "get_orders",
+        "description": "Get current daily customer orders with product names and totals. "
+                       "Use for 'what orders do we have?', 'what's pending?', "
+                       "'how much revenue today?'",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "in_production", "fulfilled"],
+                    "description": "Filter by order status"
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Filter by delivery date (YYYY-MM-DD)"
+                },
+            },
+        },
+    },
+    {
+        "name": "get_products_list",
+        "description": "Get all products/arrangements with their flower recipes. "
+                       "Use for 'what products do we sell?', 'what goes into a dozen roses?'",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_vendors_list",
+        "description": "Get all vendors with contact info, delivery schedules, and flower pricing. "
+                       "Use for 'who sells roses?', 'vendor info', 'who delivers on Wednesday?'",
         "input_schema": {
             "type": "object",
             "properties": {},
