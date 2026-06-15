@@ -10,6 +10,7 @@ from flask_cors import CORS
 
 import config
 from agent import chat
+from auth import authenticate, AuthError
 
 # Logging
 logging.basicConfig(
@@ -59,6 +60,12 @@ def api_chat():
             "session_id": "the-session-id"
         }
     """
+    # Require a valid, allowlisted Blooms OS session before doing anything.
+    try:
+        user = run_async(authenticate(request.headers.get("Authorization")))
+    except AuthError as e:
+        return jsonify({"error": e.message}), e.status
+
     data = request.get_json()
     if not data or not data.get("message"):
         return jsonify({"error": "message is required"}), 400
@@ -70,7 +77,7 @@ def api_chat():
     # Get or create session ID
     session_id = data.get("session_id") or str(uuid.uuid4())
 
-    log.info(f"Chat [{session_id[:8]}]: {user_message[:100]}")
+    log.info(f"Chat [{session_id[:8]}] {user['email']}: {user_message[:100]}")
 
     try:
         response_text = run_async(chat(session_id, user_message))
@@ -90,6 +97,11 @@ def api_chat():
 @app.route("/api/sessions/<session_id>", methods=["DELETE"])
 def clear_session(session_id):
     """Clear a chat session."""
+    try:
+        run_async(authenticate(request.headers.get("Authorization")))
+    except AuthError as e:
+        return jsonify({"error": e.message}), e.status
+
     from agent import _sessions
     if session_id in _sessions:
         del _sessions[session_id]
