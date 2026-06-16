@@ -12,6 +12,18 @@ VS_SUPABASE_KEY = os.getenv("VS_SUPABASE_KEY", "")
 BLOOMS_SUPABASE_URL = os.getenv("BLOOMS_SUPABASE_URL", "")
 BLOOMS_SUPABASE_KEY = os.getenv("BLOOMS_SUPABASE_KEY", "")
 
+# --- Email lead poller --------------------------------------------------------
+# Reads the shop's Gmail inbox over IMAP, classifies prospective event/floral
+# inquiries with Claude, and creates a lead in Blooms via the submit_event_inquiry
+# RPC. Read-only on the inbox (never marks read / moves / deletes). If the inbox
+# credentials below are unset, the poller logs "not configured" and does nothing,
+# so the app still boots fine. Use a Gmail App Password (not the account password).
+BLOOMS_INBOX_EMAIL = os.getenv("BLOOMS_INBOX_EMAIL", "")
+BLOOMS_INBOX_APP_PASSWORD = os.getenv("BLOOMS_INBOX_APP_PASSWORD", "")
+IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
+EMAIL_POLL_INTERVAL = int(os.getenv("EMAIL_POLL_INTERVAL", "300"))  # seconds
+EMAIL_LOOKBACK_DAYS = int(os.getenv("EMAIL_LOOKBACK_DAYS", "7"))
+
 # --- Auth ---------------------------------------------------------------------
 # The Blooms OS project that issues the access tokens the frontend sends. Used
 # only to validate those tokens (signature + expiry) and read the caller's email.
