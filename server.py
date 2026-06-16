@@ -11,6 +11,7 @@ from flask_cors import CORS
 import config
 from agent import chat
 from auth import authenticate, AuthError
+from email_poller import start_email_poller
 
 # Logging
 logging.basicConfig(
@@ -29,6 +30,16 @@ _loop = asyncio.new_event_loop()
 def run_async(coro):
     """Run an async coroutine from sync Flask context."""
     return _loop.run_until_complete(coro)
+
+
+# Start the email -> lead poller once at import (so it runs under gunicorn, which
+# imports `server:app` rather than executing __main__). It's a no-op when the
+# inbox env vars are unset, so the app still boots fine without them.
+# Note: the Procfile runs gunicorn with --workers 2, so up to 2 poller threads
+# (one per worker process) may run concurrently. That's acceptable: every message
+# is claimed atomically via the claim_email RPC, so only one thread ever creates
+# a lead for a given email.
+start_email_poller()
 
 
 @app.route("/health", methods=["GET"])
