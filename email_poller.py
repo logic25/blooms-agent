@@ -99,6 +99,49 @@ def _extract_body(msg) -> str:
     return ""
 
 
+# Limits for attachment extraction — keep the Claude payload and memory bounded.
+_MAX_PDFS = 3
+_MAX_PDF_BYTES = 10 * 1024 * 1024  # ~10 MB per PDF
+
+
+def _extract_pdfs(msg) -> list:
+    """Walk the message and return PDF attachments as (filename, bytes) tuples.
+
+    A part counts as a PDF if its content-type is application/pdf or its filename
+    ends in .pdf. Capped at the first _MAX_PDFS PDFs and _MAX_PDF_BYTES each so a
+    huge attachment can't blow up memory or the Claude request."""
+    pdfs: list = []
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        if len(pdfs) >= _MAX_PDFS:
+            break
+        if part.is_multipart():
+            continue
+        ctype = (part.get_content_type() or "").lower()
+        filename = part.get_filename() or ""
+        try:
+            filename = _decode(filename)
+        except Exception:
+            pass
+        is_pdf = ctype == "application/pdf" or filename.lower().endswith(".pdf")
+        if not is_pdf:
+            continue
+        try:
+            data = part.get_payload(decode=True)
+        except Exception:
+            continue
+        if not data:
+            continue
+        if len(data) > _MAX_PDF_BYTES:
+            log.warning(
+                f"Skipping oversized PDF {filename or '(unnamed)'!r}: "
+                f"{len(data)} bytes > {_MAX_PDF_BYTES}"
+            )
+            continue
+        pdfs.append((filename or "attachment.pdf", data))
+    return pdfs
+
+
 def _part_text(part) -> str:
     try:
         raw = part.get_payload(decode=True)
@@ -181,6 +224,37 @@ def _submit_lead(lead: dict) -> bool:
         return False
 
 
+def _submit_invoice(invoice: dict, subject: str, from_email: str) -> bool:
+    """POST an extracted vendor invoice to the submit_vendor_invoice RPC. v1 just
+    records the invoice for owner review (no cost posting). Returns True on HTTP
+    200, False otherwise."""
+    url = f"{BLOOMS_SUPABASE_URL.rstrip('/')}/rest/v1/rpc/submit_vendor_invoice"
+    headers = {
+        "apikey": BLOOMS_SUPABASE_KEY,
+        "Authorization": f"Bearer {BLOOMS_SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "_vendor": invoice.get("vendor"),
+        "_invoice_number": invoice.get("invoice_number"),
+        "_amount": invoice.get("amount"),
+        "_invoice_date": invoice.get("invoice_date"),
+        "_line_items": invoice.get("line_items") or [],
+        "_email_subject": subject or None,
+        "_from_email": from_email or None,
+    }
+    try:
+        with httpx.Client(timeout=20) as client:
+            resp = client.post(url, headers=headers, json=body)
+        if resp.status_code == 200:
+            return True
+        log.error(f"submit_vendor_invoice HTTP {resp.status_code}: {resp.text[:200]}")
+        return False
+    except Exception as e:
+        log.error(f"submit_vendor_invoice error: {e}")
+        return False
+
+
 def _process_message(msg) -> None:
     """Classify a single message and, if it's an inquiry, create a lead. Claims
     the message id when it should not be looked at again. Any exception here is
@@ -203,15 +277,44 @@ def _process_message(msg) -> None:
     from_header = _decode(msg.get("From"))
     subject = _decode(msg.get("Subject"))
     body = _extract_body(msg)
+    pdfs = _extract_pdfs(msg)
 
-    result = classify_email(subject, from_header, body)
+    result = classify_email(subject, from_header, body, pdfs=pdfs)
+    kind = result.get("kind", "other")
 
-    if not result.get("is_inquiry"):
-        log.info(f"Non-inquiry: {subject[:60]!r} from {from_header[:60]!r}")
+    from_name, from_email = parseaddr(from_header)
+
+    if kind == "invoice":
+        # Require enough to be a real, identifiable invoice — at least a vendor
+        # OR an invoice number, plus a non-null amount. Otherwise skip (already
+        # claimed, which is fine; v1 only records for owner review).
+        vendor = result.get("vendor")
+        invoice_number = result.get("invoice_number")
+        amount = result.get("amount")
+        if not (vendor or invoice_number) or amount is None:
+            log.info(
+                f"Invoice missing required fields, skipping: "
+                f"vendor={vendor!r} num={invoice_number!r} amount={amount!r} "
+                f"— {subject[:60]!r}"
+            )
+            return
+        if _submit_invoice(result, subject, from_email):
+            log.info(
+                f"Invoice captured: {vendor or '(unknown vendor)'} "
+                f"#{invoice_number or '(no number)'} ${amount}"
+            )
+        else:
+            log.error(
+                f"Invoice submit FAILED after claim (won't retry — recover "
+                f"manually): {subject[:60]!r} from {from_header[:60]!r}"
+            )
+        return
+
+    if kind != "inquiry":
+        log.info(f"Non-invoice/non-inquiry: {subject[:60]!r} from {from_header[:60]!r}")
         return
 
     # It's an inquiry. Fill gaps from the From header.
-    from_name, from_email = parseaddr(from_header)
     if not result.get("email"):
         result["email"] = from_email or None
     if not result.get("name"):
