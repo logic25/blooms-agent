@@ -25,13 +25,18 @@ log = logging.getLogger("blooms.lead_parser")
 # Reuse the same client/key/model the agent uses.
 _client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
-EVENT_TYPES = {"Wedding", "Corporate", "Birthday", "Sympathy", "Other"}
+EVENT_TYPES = {"Wedding", "Corporate", "Birthday", "Sympathy", "Donation", "Other"}
 
 _SYSTEM_PROMPT = (
     "You triage the inbox of a flower shop (Blooms in Bunches). For each email you "
     "classify it into exactly one of three kinds:\n"
     '  - "inquiry": a NEW event or floral inquiry from a prospective customer '
-    "(wedding, corporate event, party/birthday, sympathy/funeral arrangements, etc.).\n"
+    "(wedding, corporate event, party/birthday, sympathy/funeral arrangements, etc.). "
+    "ALSO treat a DONATION or SPONSORSHIP request as an inquiry — e.g. a school, "
+    "church, charity, nonprofit, PTA, or fundraiser asking the shop to DONATE or "
+    "sponsor flowers/arrangements/a gift basket for a raffle, gala, auction, or "
+    "event (they are asking to receive, not to buy). Tag these event_type "
+    '"Donation".\n'
     '  - "invoice": a vendor/supplier BILL or INVOICE addressed to the shop — e.g. a '
     "flower wholesaler such as Prime Petals or J. Merullo Imports billing the shop for "
     "stems/supplies. These typically have an invoice number, an amount due/total, and "
@@ -44,7 +49,7 @@ _SYSTEM_PROMPT = (
     "Respond with a single JSON object whose shape depends on the kind.\n\n"
     'For an inquiry:\n'
     '{"kind": "inquiry", "name": string|null, "email": string|null, '
-    '"phone": string|null, "event_type": "Wedding"|"Corporate"|"Birthday"|"Sympathy"|"Other", '
+    '"phone": string|null, "event_type": "Wedding"|"Corporate"|"Birthday"|"Sympathy"|"Donation"|"Other", '
     '"event_date": ISO-8601 date string|null, "guest_count": integer|null, '
     '"budget_min": number|null, "budget_max": number|null, '
     '"message": "a 1-2 sentence summary of what they want"}\n\n'
@@ -56,7 +61,9 @@ _SYSTEM_PROMPT = (
     '{"kind": "other"}\n\n'
     "Rules:\n"
     "- Respond with ONLY the JSON object, no prose, no markdown fences.\n"
-    "- event_type must be one of the five allowed values; use \"Other\" if unsure.\n"
+    "- event_type must be one of the six allowed values; use \"Other\" if unsure, "
+    "but use \"Donation\" whenever the sender is asking the shop to give/sponsor "
+    "rather than to buy.\n"
     "- Use null for any field you cannot determine. Do not invent values.\n"
     "- Dates must be calendar dates in YYYY-MM-DD form, or null.\n"
     "- amount is the invoice total / amount due as a plain number (no currency symbol).\n"
