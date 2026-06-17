@@ -191,6 +191,15 @@ def _process_message(msg) -> None:
         log.warning("Skipping message with no Message-ID header")
         return
 
+    # Claim FIRST — this is the cross-worker lock. gunicorn runs 2 workers, each
+    # with its own poller thread; without an up-front claim both would classify
+    # AND create a lead for the same email (duplicate leads). claim_email is an
+    # atomic insert-on-conflict, so exactly one worker gets True and proceeds;
+    # the other gets False and skips. (Trade-off: a claimed message whose lead
+    # submit later fails is not retried — logged loudly below for manual recovery.)
+    if not _claim_email(message_id):
+        return
+
     from_header = _decode(msg.get("From"))
     subject = _decode(msg.get("Subject"))
     body = _extract_body(msg)
@@ -198,9 +207,7 @@ def _process_message(msg) -> None:
     result = classify_email(subject, from_header, body)
 
     if not result.get("is_inquiry"):
-        # Not a lead — claim so we never re-examine (and re-spend tokens on) it.
-        if _claim_email(message_id):
-            log.info(f"Non-inquiry claimed: {subject[:60]!r} from {from_header[:60]!r}")
+        log.info(f"Non-inquiry: {subject[:60]!r} from {from_header[:60]!r}")
         return
 
     # It's an inquiry. Fill gaps from the From header.
@@ -210,25 +217,22 @@ def _process_message(msg) -> None:
     if not result.get("name"):
         result["name"] = (_decode(from_name).strip() or None) if from_name else None
 
-    # submit_event_inquiry requires name + email. If we still have no email,
-    # there's nothing actionable — claim it so we don't keep retrying forever.
     if not result.get("email"):
-        log.info(f"Inquiry with no email, claiming: {subject[:60]!r}")
-        _claim_email(message_id)
+        log.info(f"Inquiry with no email, skipping: {subject[:60]!r}")
         return
     if not result.get("name"):
         result["name"] = result["email"]
 
     if _submit_lead(result):
-        # Only claim AFTER the lead is safely recorded, so a transient failure
-        # retries next cycle instead of silently dropping a real lead.
-        _claim_email(message_id)
         log.info(
             f"Lead created from email: {result['name']} <{result['email']}> "
             f"({result['event_type']}) — {subject[:60]!r}"
         )
     else:
-        log.warning(f"Lead submit failed, will retry next cycle: {subject[:60]!r}")
+        log.error(
+            f"Lead submit FAILED after claim (won't retry — recover manually): "
+            f"{subject[:60]!r} from {from_header[:60]!r}"
+        )
 
 
 def _poll_once() -> None:
