@@ -11,6 +11,7 @@ from flask_cors import CORS
 import config
 from agent import chat
 from auth import authenticate, AuthError
+from content_generator import start_content_generator
 from email_poller import start_email_poller
 
 # Logging
@@ -40,6 +41,10 @@ def run_async(coro):
 # is claimed atomically via the claim_email RPC, so only one thread ever creates
 # a lead for a given email.
 start_email_poller()
+
+# Weekly content drafts (Mondays). Files drafts to the Content page for review;
+# nothing posts publicly. The server-side recent-draft guard keeps it idempotent.
+start_content_generator()
 
 
 @app.route("/health", methods=["GET"])
